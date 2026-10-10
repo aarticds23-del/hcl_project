@@ -16,13 +16,20 @@ class Embeddings:
     def name(self) -> str:
         return "configured-local-embeddings"
 
-    def embed_query(self, input: List[str]) -> List[List[float]]:
+    def embed_query(self, input: Any) -> List[List[float]]:
+        if isinstance(input, str):
+            input = [input]
         return self(input)
 
-    def embed_documents(self, input: List[str]) -> List[List[float]]:
+    def embed_documents(self, input: Any) -> List[List[float]]:
+        if isinstance(input, str):
+            input = [input]
         return self(input)
 
-    def __call__(self, input: List[str]) -> List[List[float]]:
+    def __call__(self, input: Any) -> List[List[float]]:
+        if isinstance(input, str):
+            input = [input]
+
         try:
             if self.model is None and not MOCK_LLM:
                 from sentence_transformers import SentenceTransformer
@@ -36,7 +43,7 @@ class Embeddings:
         vectors = []
         for text in input:
             v = [0.0] * 128
-            for word in re.findall(r"[a-z0-9]{3,}", text.lower()):
+            for word in re.findall(r"[a-z0-9]{3,}", str(text).lower()):
                 bucket = int(hashlib.sha256(word.encode()).hexdigest(), 16) % 128
                 v[bucket] += 1
             norm = sum(x * x for x in v) ** 0.5 or 1
@@ -57,7 +64,9 @@ def collection():
 
 def chunks(text: str, size: int = 800, overlap: int = 120) -> List[str]:
     """Splits text into chunks of specified size with overlap."""
-    step = size - overlap
+    if not text:
+        return []
+    step = max(size - overlap, 1)
     return [text[i : i + size] for i in range(0, max(len(text), 1), step)]
 
 
@@ -97,6 +106,9 @@ def index_document(doc_id: str, text: str, metadata: Dict[str, Any]) -> int:
 
     for section_index, (title, body) in enumerate(sections(text)):
         for part_index, part in enumerate(chunks(body)):
+            part_str = part.strip()
+            if not part_str:
+                continue
             chunk_id = f"{doc_id}:s{section_index}:c{part_index}"
             ids.append(chunk_id)
             documents.append(part)
@@ -122,7 +134,7 @@ def remove_document(doc_id: str) -> None:
     """Remove all indexed chunks belonging to the given doc_id."""
     col = collection()
     found = col.get(where={"doc_id": doc_id}, include=[])
-    if found["ids"]:
+    if found and found.get("ids"):
         col.delete(ids=found["ids"])
 
 
@@ -141,18 +153,27 @@ def rebuild(documents: List[Dict[str, Any]]) -> int:
 
 
 def search(question: str, top_k: int = TOP_K) -> List[Dict[str, Any]]:
-    """Retrieve top_k semantic matches for the question from Chroma."""
+    """Retrieve top_k semantic matches for the question from Chroma safely."""
     col = collection()
+    total_docs = col.count()
+    if total_docs == 0:
+        return []
+
+    # In ChromaDB, n_results cannot exceed total documents in the collection
+    effective_k = min(top_k, total_docs)
     r = col.query(
         query_texts=[question],
-        n_results=top_k,
+        n_results=effective_k,
         include=["documents", "metadatas", "distances"],
     )
+    if not r or not r.get("ids") or not r["ids"][0]:
+        return []
+
     return [
         {
-            **r["metadatas"][0][i],
-            "text": r["documents"][0][i],
-            "distance": r["distances"][0][i],
+            **(r["metadatas"][0][i] if r.get("metadatas") and r["metadatas"][0] else {}),
+            "text": r["documents"][0][i] if r.get("documents") and r["documents"][0] else "",
+            "distance": r["distances"][0][i] if r.get("distances") and r["distances"][0] else 0.0,
         }
         for i in range(len(r["ids"][0]))
     ]
